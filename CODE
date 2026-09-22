@@ -1,0 +1,165 @@
+#include <Arduino.h>
+#include <driver/i2s.h>
+#include "EBYTE.h"
+
+// =============================================================
+// PIN DEFINITIONS FOR ESP32-S3 SUPERMINI
+// =============================================================
+#define PTT_PIN        1
+
+// INMP441 I2S Microphone Pins
+#define I2S_MIC_SD     4
+#define I2S_MIC_WS     5
+#define I2S_MIC_SCK    6
+
+// MAX98357A I2S Amplifier Pins
+#define I2S_AMP_DIN    7
+#define I2S_AMP_LRC    8
+#define I2S_AMP_BCLK   9
+
+// EBYTE E32 LoRa Serial Pins
+#define LORA_RX_PIN    43
+#define LORA_TX_PIN    44
+#define LORA_M0_PIN    -1  // Connected directly to GND
+#define LORA_M1_PIN    -1  // Connected directly to GND
+
+// =============================================================
+// AUDIO BUFFER CONFIGURATION
+// =============================================================
+#define SAMPLE_RATE    8000
+#define BUFFER_SIZE    512
+#define MAX_RECORD_SEC 4
+#define AUDIO_BUF_LEN  (SAMPLE_RATE * MAX_RECORD_SEC)
+
+uint8_t audioBuffer[AUDIO_BUF_LEN];
+size_t recordedBytes = 0;
+
+HardwareSerial LoRaSerial(1);
+EBYTE LoRa(&LoRaSerial, LORA_M0_PIN, LORA_M1_PIN, -1);
+
+// Initialize I2S Microphone (INMP441)
+void initI2SMic() {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = BUFFER_SIZE,
+    .use_apll = false
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_MIC_SCK,
+    .ws_io_num = I2S_MIC_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_MIC_SD
+  };
+
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &pin_config);
+}
+
+// Initialize I2S DAC Amplifier (MAX98357A)
+void initI2SAmp() {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = BUFFER_SIZE,
+    .use_apll = false
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_AMP_BCLK,
+    .ws_io_num = I2S_AMP_LRC,
+    .data_out_num = I2S_AMP_DIN,
+    .data_in_num = I2S_PIN_NO_CHANGE
+  };
+
+  i2s_driver_install(I2S_NUM_1, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_1, &pin_config);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PTT_PIN, INPUT_PULLUP);
+
+  // Initialize LoRa Hardware Serial
+  LoRaSerial.begin(9600, SERIAL_8N1, LORA_RX_PIN, LORA_TX_PIN);
+
+  if (LoRa.init()) {
+    Serial.println("ESP32-S3 SuperMini: LoRa initialized successfully!");
+  } else {
+    Serial.println("Error: LoRa module not found!");
+  }
+
+  // Configure LoRa module parameters for maximum range
+  LoRa.SetAirDataRate(ADR_1200);     // Low data rate = Longest range
+  LoRa.SetAddressH(0x00);
+  LoRa.SetAddressL(0x01);
+  LoRa.SetChannel(0x17);             // 868MHz / 915MHz channel
+  LoRa.SetTransmitPower(OPT_TP30);   // 30dBm = 1 Watt MAX Power
+  LoRa.SaveParameters(PERMANENT);
+
+  initI2SMic();
+  initI2SAmp();
+
+  Serial.println("System Ready. Press PTT to record and transmit voice.");
+}
+
+void loop() {
+  // 1. TRANSMIT MODE (When PTT button is pressed)
+  if (digitalRead(PTT_PIN) == LOW) {
+    Serial.println("Recording audio...");
+    recordedBytes = 0;
+
+    // Record voice while button is held (Max 4 seconds)
+    while (digitalRead(PTT_PIN) == LOW && recordedBytes < AUDIO_BUF_LEN) {
+      size_t bytesRead = 0;
+      i2s_read(I2S_NUM_0, &audioBuffer[recordedBytes], BUFFER_SIZE, &bytesRead, portMAX_DELAY);
+      recordedBytes += bytesRead;
+    }
+
+    Serial.printf("Recorded %d bytes. Transmitting via LoRa...\n", recordedBytes);
+
+    // Send audio packet chunks via LoRa
+    size_t sentBytes = 0;
+    while (sentBytes < recordedBytes) {
+      size_t chunk = min((size_t)58, recordedBytes - sentBytes);
+      LoRaSerial.write(&audioBuffer[sentBytes], chunk);
+      sentBytes += chunk;
+      delay(10);
+    }
+    Serial.println("Transmission complete!");
+    delay(300);
+  }
+
+  // 2. RECEIVE MODE (When audio data arrives from LoRa)
+  if (LoRaSerial.available()) {
+    Serial.println("Receiving incoming voice message...");
+    size_t rxBytes = 0;
+    unsigned long startTime = millis();
+    
+    // Receive buffer chunks
+    while (millis() - startTime < 3000) {
+      while (LoRaSerial.available() && rxBytes < AUDIO_BUF_LEN) {
+        audioBuffer[rxBytes] = LoRaSerial.read();
+        rxBytes++;
+        startTime = millis();
+      }
+    }
+
+    if (rxBytes > 0) {
+      Serial.printf("Received %d bytes. Playing audio...\n", rxBytes);
+      size_t bytesWritten = 0;
+      i2s_write(I2S_NUM_1, audioBuffer, rxBytes, &bytesWritten, portMAX_DELAY);
+    }
+  }
+}
